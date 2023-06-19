@@ -1,1 +1,167 @@
+variables:
+  GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  DB_BUILD_NAME: "${ARTIFACTORY_PROJECT_KEY}_${PRODUCT_NAMESPACE}_db_build"
+  DACPAC_VERSION_IDENTIFIER: ${CI_PROJECT_NAME}_${DACPAC_VERSION}_${RELEASE_IDENIFIER}
+stages:  
+  #--------------GitLab CI Pipeline--------------
+  - preperation           #[versioning]
+  - test                  #[sonar-quality-gates, unit-test, integration-test] 
+  - build                 #[dotnet-build] 
+  - publish-dacpac        #[docker-build-scan-publish]
+  - export                #[export-to-aws]
+
+versioning:
+  stage: preperation
+  image: $DOCKER_REGISTRY/$DOCKER_BASE_REPO/$DOTNETSDK_IMAGE_TAG
+  variables:
+    RELEASE_IDENIFIER: "latest"  
+  script:    
+    - echo Commit Branch :- ${PRODUCT_NAMESPACE}
+    - echo Commit Branch :- ${CI_COMMIT_BRANCH}
+    - echo prod Branch :- ${PRODUCTION_BRANCH}
+    - >
+      if [ "${CI_COMMIT_BRANCH}" == "${PRODUCTION_BRANCH}" ]; then
+        DATABASE_REPO=$DATABASE_PROD_REPO;
+      else
+        DATABASE_REPO=$DATABASE_NONPROD_REPO;
+      fi
+    - echo DATABASE_REPO :- ${DATABASE_REPO}       
+    - echo DOCKER_REPO :- ${DOCKER_BASE_REPO}
+    - echo default RELEASE_IDENIFIER :- ${RELEASE_IDENIFIER}
+    - >
+      if [ "${CI_COMMIT_BRANCH}" == "${PRODUCTION_BRANCH}" ]; then
+        export RELEASE_IDENIFIER='latest'
+      elif [[ "${CI_COMMIT_BRANCH}" =~ ^SIT\/.*$ ]]; then
+        export RELEASE_IDENIFIER='RELEASE'
+      elif [[ "${CI_COMMIT_BRANCH}" =~ ^UAT\/.*$ ]]; then
+        export RELEASE_IDENIFIER='RELEASE-BETA'
+      else
+        export RELEASE_IDENIFIER='SNAPSHOT'        
+      fi    
+    - echo  RELEASE_IDENIFIER :- ${RELEASE_IDENIFIER} 
+    - PROJECT_NAME=$CI_PROJECT_NAME 
+    - DACPAC_VERSION=$(grep -m 1 "<DacVersion>" "$PROJECT_NAME.sqlproj"| sed 's/.*<DacVersion>\(.*\)<\/DacVersion>.*/\1/' | tr -d '\r')
+    - echo $DACPAC_VERSION
+    - export RELEASE_VERSION=${DACPAC_VERSION}_${RELEASE_IDENIFIER}
+    #Set All Variables to DOT ENV
+    - echo "DATABASE_REPO=${DATABASE_REPO}" >> build.env
+    - echo "DOCKER_REPO=${DOCKER_BASE_REPO}" >> build.env
+    - echo "RELEASE_IDENIFIER=${RELEASE_IDENIFIER}" >> build.env
+    - echo "DACPAC_VERSION=${DACPAC_VERSION}" >> build.env
+    - cat build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  only:
+    - merge_requests
+    - DEV
+    - main
+    - /^release\/.*$/   
+
+sonar-quality-gates:
+  stage: test
+  image: $DOCKER_REGISTRY/$DOCKER_BASE_REPO/$SONAR_IMAGE_TAG  
+  needs: [versioning]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+  dependencies:
+    - versioning  
+  script:
+    # Invoke Sonar Quality Gates
+    - sonar-scanner -Dsonar.projectKey=${CI_PROJECT_ROOT_NAMESPACE}_${CI_PROJECT_NAME} -Dsonar.organization=${CI_PROJECT_ROOT_NAMESPACE} -Dsonar.projectVersion=${RELEASE_VERSION} -Dsonar.qualitygate.wait=true
+  only:
+    - merge_requests
+    - DEV 
+    - main
+    - /^release\/.*$/
+  allow_failure: true
+
+dacpac-build:
+  stage: build
+  image: $DOCKER_REGISTRY/$DOCKER_BASE_REPO/$DOTNETSDK_IMAGE_TAG
+  needs: [versioning]
+  dependencies:
+    - versioning
+  script:
+    - echo "dacpac creation:" 
+    - dotnet build --configuration Release /p:SqlTargetName=${DACPAC_VERSION_IDENTIFIER} /p:WriteDacVersionPath=WriteDacVersion.targets
+  artifacts:
+    expire_in: 1 week
+    name: "$CI_JOB_STAGE-$CI_COMMIT_REF_NAME"
+    paths:
+      - bin/Release/${DACPAC_VERSION_IDENTIFIER}.dacpac
+  only:
+    - merge_requests
+    - DEV
+    - main
+    - /^release\/.*$/
+
+publish-dacpac-artifact:
+  stage: publish-dacpac
+  image: $DOCKER_REGISTRY/$DOCKER_BASE_REPO/$DOCKER_IMAGE_TAG
+  needs: [sonar-quality-gates, versioning, dacpac-build]
+  dependencies:
+    - versioning
+    - dacpac-build
+  before_script: 
+    - apk add --update curl && rm -rf /var/cache/apk/* 
+    # Install Jfrog CLI
+    - curl -fL -u $ARTIFACTORY_USER:$ARTIFACTORY_PASS $ARTIFACTORY_CLI_URL | sh -s $ARTIFACTORY_CLI_VERSION       
+    # Configure Artifactory instance
+    - ./jf config add $ARTIFACTORY_SERVER --url=$ARTIFACTORY_URL --user=$ARTIFACTORY_USER --access-token=$ARTIFACTORY_PASS --interactive=false
+    - ./jf c show
+    - ./jf -v   
+    - export JFROG_CLI_EXTRACTORS_REMOTE=$ARTIFACTORY_SERVER/$DATABASE_REPO 
+  script:
+    - echo "jFrogUpload dacpac upload:"   
+    # Upload the produced artifat
+    - ./jf rt u "bin/Release/${DACPAC_VERSION_IDENTIFIER}.dacpac" $DATABASE_REPO/$DB_COMPONENT_BASE_PATH/$CI_PROJECT_NAME/ --flat=true --recursive=false --build-name=$DB_BUILD_NAME --build-number=$CI_JOB_ID 
+  only:
+    - DEV 
+    - main
+    - /^release\/.*$/
+
+export-images:
+  stage: export
+  image: $DOCKER_REGISTRY/$DOCKER_BASE_REPO/$DOCKER_IMAGE_TAG
+  #image: banst/awscli
+  needs: [publish-dacpac-artifact, versioning, dacpac-build]
+  services:
+    - name: $DOCKER_REGISTRY/$DOCKER_BASE_REPO/docker:dind
+      alias: docker
+  variables:
+     HPS_IMAGE_TAG: $ARTIFACT_ID:$RELEASE_VERSION        
+  before_script:
+     # Docker Login to JFrog Docker Registery
+    - docker login -u $ARTIFACTORY_USER -p $ARTIFACTORY_PASS $ARTIFACTORY_URL
+    # Installing curl as it is not part of the docker image
+    - apk add --update curl && rm -rf /var/cache/apk/* 
+    # Install Jfrog CLI
+    - curl -fL -u $ARTIFACTORY_USER:$ARTIFACTORY_PASS $ARTIFACTORY_CLI_URL | sh -s $ARTIFACTORY_CLI_VERSION       
+    # Configure Artifactory instance
+    - ./jf config add $ARTIFACTORY_SERVER --url=$ARTIFACTORY_URL --user=$ARTIFACTORY_USER --access-token=$ARTIFACTORY_PASS --interactive=false
+    - ./jf c show
+    - ./jf -v         
+    # Pull AWS CLI Image
+    - docker pull $DOCKER_REGISTRY/$DOCKER_BASE_REPO/amazon/aws-cli:latest    
+    # Create an Alias to simply the command execution
+    - alias aws='docker run --rm -v ~/.aws:/root/.aws -v $(pwd):/aws $DOCKER_REGISTRY/$DOCKER_BASE_REPO/amazon/aws-cli'    
+    # Configure AWS Credentials as we are running DIND
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set region $AWS_DEFAULT_REGION 
+  script:
+    - echo DATABASE_REPO :- $DATABASE_REPO
+    - echo DB_COMPONENT_BASE_PATH :- $DB_COMPONENT_BASE_PATH
+    - echo CI_PROJECT_NAME :- $CI_PROJECT_NAME
+    - echo PRODUCT_NAMESPACE :- $PRODUCT_NAMESPACE
+    - echo DACPAC_VERSION_IDENTIFIER :- {DACPAC_VERSION_IDENTIFIER}
+    - echo AWS_ARTIFACTS_STORAGE :- $AWS_ARTIFACTS_STORAGE
+    - ./jf rt dl  $DATABASE_REPO/$DB_COMPONENT_BASE_PATH/$CI_PROJECT_NAME/  "dacpacFolder/" 
+    - echo "s3 dacpac upload:"  
+    - aws s3 cp dacpacFolder/$DB_COMPONENT_BASE_PATH/$CI_PROJECT_NAME/${DACPAC_VERSION_IDENTIFIER}.dacpac s3://$AWS_ARTIFACTS_STORAGE/$PRODUCT_NAMESPACE/
+  only:
+    - DEV 
+    - main
+    - /^release\/.*$/
 
